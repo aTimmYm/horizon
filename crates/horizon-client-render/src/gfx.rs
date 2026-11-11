@@ -26,9 +26,7 @@ const CRUMBLING_BLEND: wgpu::BlendState = wgpu::BlendState {
     },
     alpha: wgpu::BlendComponent::REPLACE,
 };
-/// `TerrainVertex` for `vs_terrain`: position, UV, packed layer and light, colour.
-/// Layer and light share one 32-bit integer fetch. Some legacy GL drivers return
-/// zero for the equivalent narrow `Uint16` and `Uint8x2` attributes.
+/// `TerrainVertex` for `vs_terrain`: position, UV, packed layer/light, colour.
 const TERRAIN_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
     wgpu::vertex_attr_array![0=>Float32x3,1=>Uint16x2,2=>Uint32,3=>Unorm8x4];
 
