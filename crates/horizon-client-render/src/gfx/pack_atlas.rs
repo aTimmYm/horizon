@@ -1263,13 +1263,17 @@ mod tests {
             stitched: None,
         };
         let inputs_default = atlas.terrain_inputs(false);
-        assert!(inputs_default
-            .declarations
-            .contains("layout(location = 2) in uint hz_v_layer_light;"));
+        assert!(
+            inputs_default
+                .declarations
+                .contains("layout(location = 2) in uint hz_v_layer_light;")
+        );
         assert!(!inputs_default.declarations.contains("layout(location = 4)"));
-        assert!(inputs_default
-            .body
-            .contains("uint hz_v_layer = hz_v_layer_light & 65535u;"));
+        assert!(
+            inputs_default
+                .body
+                .contains("uint hz_v_layer = hz_v_layer_light & 65535u;")
+        );
         assert!(inputs_default.body.contains("hz_v_layer_light >> 24u"));
         assert!(
             inputs_default
