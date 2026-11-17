@@ -71,6 +71,9 @@ pub(super) struct Parked {
     rockets: horizon_client::join_seq::JoinList<fireworks::Rocket>,
     ominous_spawners: Vec<ominous_item_spawner::OminousItemSpawner>,
     tnts: horizon_client::join_seq::JoinList<tnt::PrimedTnt>,
+    /// Its orbs', TNT's and falling blocks' place in the tick order beyond
+    /// their joins (`ordered_tick::TickRestarts`).
+    tick_restarts: super::ordered_tick::TickRestarts,
     hoppers: HashMap<(i32, i32, i32), machines::HopperState>,
     pub(super) mobs: horizon_client::join_seq::JoinList<Mob>,
     /// The entity ids of the level's fence knots (`knot_ids`).
@@ -128,6 +131,14 @@ impl Default for Pass {
     }
 }
 
+/// How long a server tick took and what it spent the time in.
+pub(super) struct TickTiming {
+    pub wall_ms: f32,
+    pub cpu_ms: Option<f32>,
+    /// As recorded in the tick, each span after the spans inside it; the ones from between ticks are left out.
+    pub raw: Vec<horizon_client::spans::Span>,
+}
+
 /// The levels not in place, by dimension.
 #[derive(Default)]
 pub(super) struct Levels {
@@ -135,9 +146,26 @@ pub(super) struct Levels {
     /// The levels whose open the mods heard (`native_level_load`), each to
     /// be told closed once.
     heard_open: Vec<Dim>,
+    /// `max-chained-neighbor-updates` of a dedicated server, for the levels it opens;
+    /// `None` is the default every other server runs with.
+    max_chained_neighbor_updates: Option<i32>,
 }
 
 impl Levels {
+    /// Sets the neighbour update chain limit of the levels made from now on.
+    pub(super) fn set_max_chained_neighbor_updates(&mut self, max: i32) {
+        self.max_chained_neighbor_updates = Some(max);
+    }
+
+    /// The block ticks of a new level, with the server's neighbour update chain limit.
+    pub(super) fn new_ticks(&self, random_tick_seed: i32) -> Ticks {
+        let mut ticks = Ticks::new(random_tick_seed);
+        if let Some(max) = self.max_chained_neighbor_updates {
+            ticks.set_max_chained_neighbor_updates(max);
+        }
+        ticks
+    }
+
     /// Clear every parked level and dimensions recorded as heard open.
     pub(super) fn clear(&mut self) {
         self.parked.clear();
@@ -160,6 +188,13 @@ impl Levels {
     /// The worlds of the levels not in place.
     pub(super) fn parked_worlds(&self) -> impl Iterator<Item = &World> {
         self.parked.values().map(|level| &level.world)
+    }
+
+    /// The streamers of the levels not in place.
+    pub(super) fn parked_streamings(
+        &self,
+    ) -> impl Iterator<Item = &horizon_client::streaming::Streaming> {
+        self.parked.values().map(|level| &level.streaming)
     }
 
     /// The world of the level not in place, in `dim`, to change.
@@ -254,7 +289,7 @@ impl Game<'_> {
             streaming,
             locator,
             save,
-            block_ticks: Ticks::new(self.level.seed as i32),
+            block_ticks: self.levels.new_ticks(self.level.seed as i32),
             tick_chunks: Default::default(),
             tickets,
             random_tick_sections: Default::default(),
@@ -278,6 +313,7 @@ impl Game<'_> {
             rockets: Default::default(),
             ominous_spawners: Vec::new(),
             tnts: Default::default(),
+            tick_restarts: Default::default(),
             hoppers: HashMap::new(),
             mobs: Default::default(),
             knot_ids: HashMap::new(),
@@ -428,6 +464,7 @@ impl Game<'_> {
         swap(&mut self.rockets, &mut p.rockets);
         swap(&mut self.ominous_spawners, &mut p.ominous_spawners);
         swap(&mut self.tnts, &mut p.tnts);
+        swap(&mut self.ordered.restarts, &mut p.tick_restarts);
         swap(&mut self.hoppers, &mut p.hoppers);
         swap(&mut self.mobs, &mut p.mobs);
         swap(&mut self.knot_ids, &mut p.knot_ids);
@@ -617,12 +654,21 @@ impl Game<'_> {
         for (k, dim) in dims.into_iter().enumerate() {
             // Each level's share of the tick (the first one also reads the network and runs the
             // tick's shared parts): `horizon-report`'s `level_*` spans.
+            horizon_threads::work::set_dim(match dim {
+                Dim::Overworld => 1,
+                Dim::Nether => 2,
+                Dim::End => 3,
+            });
             let _level_span = horizon_client::spans::guard(match dim {
                 Dim::Overworld => "level_overworld",
                 Dim::Nether => "level_the_nether",
                 Dim::End => "level_the_end",
             });
-            if let Err(e) = self.enter_level(None, dim) {
+            // The level's own share of the pass, outside its world tick: a slow tick's line names
+            // each of them, and `level_tick` holds the world tick itself (#15349).
+            if let Err(e) =
+                horizon_client::spans::time("enter_level", || self.enter_level(None, dim))
+            {
                 result = Err(e);
                 break;
             }
@@ -633,10 +679,14 @@ impl Game<'_> {
                 packets_drained: false,
             };
             if observe_level {
+                let _span = horizon_client::spans::guard("mods_level_tick_pre");
                 self.native_level_tick_pre(dim.id());
             }
-            self.update_dedicated_streaming();
-            self.update_world();
+            horizon_client::spans::time("dedicated_streaming", || {
+                self.update_dedicated_streaming();
+            });
+            horizon_client::spans::time("update_world", || self.update_world());
+            let tick_span = horizon_client::spans::guard("level_tick");
             result = horizon_client::block_contact::in_level(
                 (self.serving.is_some() || self.options.dedicated.is_some()).then_some(dim.id()),
                 || {
@@ -653,16 +703,19 @@ impl Game<'_> {
                     }
                 },
             );
+            drop(tick_span);
             if result.is_err() {
                 break;
             }
             if observe_level {
+                let _span = horizon_client::spans::guard("mods_level_tick_post");
                 self.native_level_tick_post(dim.id());
             }
-            self.publish_server_debug(dim);
+            horizon_client::spans::time("server_debug", || self.publish_server_debug(dim));
             // An entity that crossed into a level that already ticked this
             // server tick is in it when the tick ends (`addDuringTeleport`).
             if running == Some(true) {
+                let _span = horizon_client::spans::guard("late_portal_arrivals");
                 let mut moved = false;
                 for &earlier in &order[..k] {
                     if !self.arrival_chunks(earlier).is_empty()
@@ -680,6 +733,7 @@ impl Game<'_> {
         if let Some(&first) = order.first()
             && self.dim != first
         {
+            let _span = horizon_client::spans::guard("enter_level");
             let _ = self.enter_level(None, first);
         }
         self.level_pass = Pass::default();
@@ -708,22 +762,30 @@ impl Game<'_> {
         Ok(())
     }
 
-    /// `tick_server` as a server thread runs it. With `HORIZON_SPIKES=MS`, a
-    /// tick longer than MS is logged with its thread CPU time and spans.
+    /// `tick_server` as a server thread runs it, timed whenever spans are on.
     pub(super) fn tick_server_timed(&mut self, paused: bool) -> Result<()> {
-        self.tick_server_spans(paused, |_, _, _, _| {})
+        self.tick_server_spans(paused, |_| {})
     }
 
-    /// `tick_server_timed`, handing the tick's wall time, thread CPU time
-    /// and spans (milliseconds, summed by name) to `record` while spans are on, with how many
-    /// spans the tick itself recorded: a dedicated server's performance report turns them on to
-    /// record its ticks.
+    /// `tick_server_timed`, handing the tick's timing to `record` while spans are on.
     pub(super) fn tick_server_spans(
         &mut self,
         paused: bool,
-        record: impl FnOnce(f32, Option<f32>, Vec<horizon_client::spans::Span>, usize),
+        record: impl FnOnce(TickTiming),
     ) -> Result<()> {
-        if self.options.spikes.is_none() && !horizon_client::spans::enabled() {
+        let started = Instant::now();
+        horizon_threads::work::tick_start();
+        let result = self.tick_server_recorded(paused, record);
+        horizon_threads::work::tick_end(started.elapsed().as_nanos() as u64);
+        result
+    }
+
+    fn tick_server_recorded(
+        &mut self,
+        paused: bool,
+        record: impl FnOnce(TickTiming),
+    ) -> Result<()> {
+        if self.options.spikes.is_none() && !horizon_client::spans::recording_here() {
             return self.tick_server(paused);
         }
         // Spans recorded since the last tick ran between ticks (the chunk pump of the wait): they
@@ -737,26 +799,28 @@ impl Game<'_> {
             .map(|(end, start)| (end - start).as_secs_f32() * 1000.0);
         // Taken every tick: nothing else takes this thread's spans.
         let raw = horizon_client::spans::take_raw();
-        let in_tick = raw.len();
         let spans = if between.is_empty() {
             horizon_client::spans::merge(&raw)
         } else {
-            horizon_client::spans::merge(&[between, raw].concat())
+            horizon_client::spans::merge(&[&between[..], &raw[..]].concat())
         };
+        // The spans go to the slow ring; whose packets or events took the tick stays in the owner's log.
         let notes = horizon_client::spans::take_notes();
         if let Some(threshold) = self.options.spikes
             && wall > threshold
+            && !notes.is_empty()
         {
-            let cpu = cpu.map_or_else(String::new, |c| format!(", cpu {c:.1} ms"));
             log::info!(
-                "Horizon: slow tick {wall:.1} ms{cpu} ({} mobs): {}{}",
-                self.mobs.len(),
-                horizon_client::spans::describe(&spans),
+                "Horizon: {wall:.1} ms tick was busy with: {}",
                 slowest_steps(&notes)
             );
         }
         self.native_server_tick_timed(wall, cpu, &spans);
-        record(wall, cpu, spans, in_tick);
+        record(TickTiming {
+            wall_ms: wall,
+            cpu_ms: cpu,
+            raw,
+        });
         result
     }
 
@@ -802,6 +866,13 @@ impl Game<'_> {
             return Some(behind);
         }
         None
+    }
+
+    /// The level whose id is exactly `id` (`MinecraftServer.getLevel` of a `ResourceKey`).
+    pub(super) fn known_level(&self, id: &str) -> Option<Dim> {
+        [Dim::Overworld, Dim::Nether, Dim::End]
+            .into_iter()
+            .find(|d| d.id() == id)
     }
 
     /// The levels this server tick runs, in `MinecraftServer.levels` order
@@ -966,17 +1037,13 @@ impl Game<'_> {
     }
 }
 
-/// A slow tick's line's end: the steps it noted as its slowest (`spans::note`), whose packets
-/// or which player's event, or nothing.
+/// The steps a slow tick noted as its slowest (`spans::note`), whose packets or which player's event.
 fn slowest_steps(notes: &[(f32, String)]) -> String {
-    if notes.is_empty() {
-        return String::new();
-    }
     let list: Vec<String> = notes
         .iter()
         .map(|(ms, what)| format!("{what} {ms:.1}"))
         .collect();
-    format!("; slowest: {}", list.join(", "))
+    list.join(", ")
 }
 
 #[cfg(test)]
@@ -993,10 +1060,9 @@ mod tests {
         assert!(levels.parked.is_empty());
     }
 
-    /// `ServerLevel.getWorldBorder`: `/worldborder` in one level leaves the others' alone.
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn each_level_keeps_its_own_world_border() {
+    /// A game on the prepared resources in `HORIZON_TEST_RESOURCES`, with no
+    /// world opened and commands allowed.
+    fn prepared_game() -> Game<'static> {
         use crate::game::{Audio, Options, Progress, Settings, load_resources};
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let settings = Settings::default();
@@ -1015,6 +1081,102 @@ mod tests {
         let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
         options.resources = root.clone();
         options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
+        // The game keeps its resources for the whole test.
+        let resources: &'static _ = Box::leak(Box::new(loaded.resources));
+        let mut game = Game::new(
+            resources,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&root),
+            None,
+        )
+        .unwrap();
+        game.build_registries();
+        game.set_allow_commands(true);
+        game
+    }
+
+    /// `WorldBorderCommand.setSize` from `/worldborder add` with a time: the
+    /// new change lasts the ticks still running plus the argument
+    /// (`getLerpTime() + time`), where `/worldborder set` replaces it.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn worldborder_add_extends_a_change_in_flight() {
+        let mut game = prepared_game();
+        assert!(game.run_command("worldborder set 100 1000"));
+        assert_eq!(game.border.remaining_ticks(), 1000);
+        // Part way through the change, where the size is between its ends.
+        for _ in 0..100 {
+            game.border.tick();
+        }
+        assert_eq!(game.border.remaining_ticks(), 900);
+        let from = game.border.size();
+        assert!(from < 59_999_968.0 && from > 100.0);
+        // The new change starts from that size and lasts the ticks still
+        // running plus the argument, not just the argument.
+        assert!(game.run_command("worldborder add -50 5s"));
+        assert_eq!(game.border.target_size(), from - 50.0);
+        assert_eq!(game.border.remaining_ticks(), 1000);
+        // `set` starts over from the size the border has now.
+        assert!(game.run_command("worldborder set 200 40"));
+        assert_eq!(game.border.target_size(), 200.0);
+        assert_eq!(game.border.remaining_ticks(), 40);
+    }
+
+    /// `ServerLevel.getWorldBorder`: `/worldborder` in one level leaves the others' alone.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn each_level_keeps_its_own_world_border() {
+        let mut game = prepared_game();
+        assert!(game.run_command("worldborder set 1000"));
+        assert!(game.run_command("execute in minecraft:the_nether run worldborder set 100"));
+        assert_eq!(game.dim, Dim::Overworld);
+        assert_eq!(game.border.size(), 1000.0);
+        let nether = game.levels.parked_border(Dim::Nether).unwrap();
+        assert_eq!(nether.size(), 100.0);
+    }
+
+    struct LogCapture;
+    static LOGGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    impl log::Log for LogCapture {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            LOGGED.lock().unwrap().push(record.args().to_string());
+        }
+        fn flush(&self) {}
+    }
+
+    /// 300 slow ticks in ten seconds log no Horizon slow-tick line, and the ring holds the last 256.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn slow_ticks_enter_the_ring_and_not_the_log() {
+        use crate::game::{Audio, Options, Progress, Settings, load_resources};
+        use horizon_client::server_perf::{ServerPerf, TickDetail, WorldCounts};
+        log::set_logger(&LogCapture).expect("no other logger in this test run");
+        log::set_max_level(log::LevelFilter::Info);
+        let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+        let settings = Settings::default();
+        let loaded = load_resources(
+            root.clone(),
+            None,
+            &root,
+            &settings,
+            Instant::now(),
+            false,
+            true,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
+        options.spikes = Some(0.0);
         let mut game = Game::new(
             &loaded.resources,
             loaded.pack,
@@ -1026,13 +1188,33 @@ mod tests {
         )
         .unwrap();
         game.build_registries();
-        game.set_allow_commands(true);
-        assert!(game.run_command("worldborder set 1000"));
-        assert!(game.run_command("execute in minecraft:the_nether run worldborder set 100"));
-        assert_eq!(game.dim, Dim::Overworld);
-        assert_eq!(game.border.size(), 1000.0);
-        let nether = game.levels.parked_border(Dim::Nether).unwrap();
-        assert_eq!(nether.size(), 100.0);
+        let mut perf = ServerPerf::new(0.0, 0.0);
+        for i in 0..300 {
+            let mut detail = None;
+            let started = Instant::now();
+            game.tick_server_spans(false, |timing| {
+                detail = Some(TickDetail {
+                    cpu_ms: timing.cpu_ms,
+                    spans: timing.raw,
+                });
+            })
+            .unwrap();
+            let wall_ms = started.elapsed().as_secs_f32() * 1000.0;
+            perf.tick(
+                f64::from(i) / 30.0,
+                wall_ms,
+                detail,
+                WorldCounts::default,
+                Vec::new,
+            );
+        }
+        let kept: Vec<u64> = perf.slow_records().map(|r| r.counter).collect();
+        assert_eq!(kept, (45..=300).collect::<Vec<u64>>());
+        let logged = LOGGED.lock().unwrap();
+        assert!(
+            logged.iter().all(|line| !line.contains("slow tick")),
+            "{logged:?}"
+        );
     }
 
     /// A game on a scratch world folder, the way `dedicated.rs` opens one

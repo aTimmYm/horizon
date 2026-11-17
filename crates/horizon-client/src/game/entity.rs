@@ -182,7 +182,7 @@ pub(super) trait Entity: EntityRules {
     fn fluid_eye_y(&self) -> f64 {
         self.bounds().max_position().y
     }
-    /// `Entity.updateFluidHeightAndDoFluidPushing`: its water and lava heights
+    /// `Entity.updateFluidInteraction`: its water and lava heights
     /// (`(0, 0)` for a kind that is not pushed by fluid), and the current of
     /// each fluid added to its velocity. One body for every kind.
     fn push_by_fluid(
@@ -241,9 +241,9 @@ pub(super) trait Entity: EntityRules {
         PushReaction::PushPull
     }
     /// Width and height of the box a portal sweep follows, or None for a kind
-    /// the game does not carry through portals (so far armor stands and
-    /// falling blocks; fishing hooks are off the walk, and
-    /// `FishingHook.canUsePortal` is false in vanilla).
+    /// the game does not carry through portals (so far falling blocks; fishing
+    /// hooks are off the walk, and `FishingHook.canUsePortal` is false in
+    /// vanilla).
     fn portal_size(&self) -> Option<(f32, f32)> {
         None
     }
@@ -554,7 +554,9 @@ mod render_bounds_tests {
             invisible: false,
             check_interval: 0,
             custom_name: None,
-            random: horizon_core::random::LegacyRandom::new(0),
+            random: horizon_core::random::EntityRandom::own(
+                horizon_core::random::LegacyRandom::new(0),
+            ),
         };
         let bounds = frame.render_bounds(1.0);
         assert!(bounds.min_position().x <= -0.71875);
@@ -601,8 +603,9 @@ macro_rules! stored_motion {
 }
 
 impl Game<'_> {
-    /// Tick an item owned by the caller. The two results are ordinary survival
-    /// and explicit consumption by a block-contact handler. `escape_speed`:
+    /// Tick an item owned by the caller. The results are ordinary survival,
+    /// explicit consumption by a block-contact handler, and the fall it landed
+    /// with on a server (its block's `fallOn` is the caller's). `escape_speed`:
     /// the item is inside a block and moves without physics this tick, pushed
     /// out at this speed.
     pub(super) fn tick_item_with_block_contacts(
@@ -612,26 +615,12 @@ impl Game<'_> {
         entity_boxes: &[Aabb],
         client: bool,
         splash: &mut impl FnMut(horizon_client::entities::ItemSplash),
-    ) -> (bool, bool) {
+    ) -> (bool, bool, super::item_entities::ahead::Landed) {
         let no_physics = escape_speed.is_some();
-        let heights = item.push_by_fluid(&self.world, &self.res.motion().fluids);
-        // Entity.baseTick splashes before moving, except on the first tick.
-        item.water_entry(heights.0 > 0.0, item.ticks == 0, splash);
-        item.lava_fall(heights.1 > 0.0);
-        let step = item.tick_move_before_block_effects(
-            &self.world,
-            self.res.facts(),
-            self.collision,
-            no_physics,
-            escape_speed,
-            heights,
-            entity_boxes,
-            Some(self.border.geometry()),
-            Some(&self.res.motion().blocks),
-        );
-        item.check_fall(&step, |fall, from, moved| {
-            self.vehicle_fall_reset(fall, from, moved)
-        });
+        let (step, landed) = self
+            .item_tables()
+            .move_item(item, escape_speed, entity_boxes, splash);
+        let landed = landed.filter(|_| !client);
         if let Some(pos) = step.vertical_contact {
             let state = self.world.block(pos.x, pos.y, pos.z);
             let position = item.position;
@@ -647,27 +636,13 @@ impl Game<'_> {
                 &mut discarded,
             );
             if discarded || item.stack.count == 0 {
-                return (false, true);
+                return (false, true, landed);
             }
         }
-        item.finish_move_block_effects(
-            &self.world,
-            self.res.facts(),
-            no_physics,
-            Some(&self.res.motion().blocks),
-            step,
-        );
-        item.push_by_bubble_column(
-            &self.world,
-            self.pack.assets.registry,
-            self.res.facts(),
-            self.collision,
-        );
-        let alive = item.tick_settle(&self.world, self.res.facts(), no_physics, step);
-        // ItemEntity.tick refreshes immersion and splashes on water entry.
-        let (water, _) = item.push_by_fluid(&self.world, &self.res.motion().fluids);
-        item.water_entry(water > 0.0, false, splash);
-        (alive, false)
+        let alive = self
+            .item_tables()
+            .settle_item(item, no_physics, step, splash);
+        (alive, false, landed)
     }
 
     /// Keep new joins after the active batch, so they tick next time.
@@ -1018,14 +993,6 @@ impl Game<'_> {
         super::boats::any_boat_wood(kind)
             .is_some_and(|(wood, chest)| self.boat_models.has(wood, chest))
     }
-    /// Whether `load_listed` loads `kind` as a vehicle that takes its mob
-    /// riders (`take_mob_passengers`): a mob, boat, minecart or primed TNT.
-    pub(super) fn listed_kind_takes_riders(&self, kind: &str) -> bool {
-        self.loads_as_mob(kind)
-            || self.loads_as_boat(kind)
-            || loads_as_cart(kind)
-            || loads_as_tnt(kind)
-    }
     /// Loads a saved entity as the first kind in `entity_lists!` that claims
     /// its type id: `Err` hands the compound back when none does.
     pub(super) fn load_listed(
@@ -1132,9 +1099,10 @@ impl Entity for Mob {
         game.mob_can_use_portal(self)
     }
     /// `PersistentEntitySectionManager.Callback.onRemove`: discard stops
-    /// section enumeration immediately, before the entity list is swept.
+    /// section enumeration immediately, before the entity list is swept; and
+    /// `EntitySelectorParser`'s `Entity::isAlive` drops a dying mob at once.
     fn selector_target(&self) -> Option<Target> {
-        (!self.removed && self.death_time == 0).then_some(Target::Mob(self.id))
+        (!self.removed && self.alive()).then_some(Target::Mob(self.id))
     }
     fn bounds(&self) -> Aabb {
         Mob::bounds(self)
@@ -1595,9 +1563,11 @@ impl Entity for ArmorStand {
     }
     /// A NoGravity stand is not swept for the blocks it stands in (plates,
     /// fire): measured beside the real server, it never presses a plate nor
-    /// catches fire, and does again once `NoGravity` is cleared.
+    /// catches fire, and does again once `NoGravity` is cleared. A marker is
+    /// not either: `ArmorStand.hasPhysics` is false for it too, so
+    /// `noPhysics` keeps it out of `applyEffectsFromBlocks`.
     fn sweeps_blocks_inside(&self) -> bool {
-        !self.no_gravity
+        !self.marker && !self.no_gravity
     }
     fn pushed_by_explosion(&self) -> bool {
         false
@@ -1609,6 +1579,18 @@ impl Entity for ArmorStand {
         } else {
             PushReaction::PushPull
         }
+    }
+    /// `ArmorStand.getDefaultDimensions`: the box a portal sweep follows, and
+    /// the size its exit is placed by. `ArmorStand.readAdditionalSaveData`
+    /// makes a stand without `hasPhysics` (a marker or a `NoGravity` one)
+    /// `noPhysics`, so `Entity.isAffectedByBlocks` never runs its sweep and it
+    /// enters no portal; a marker's box is `MARKER_DIMENSIONS`, 0 by 0, too.
+    fn portal_size(&self) -> Option<(f32, f32)> {
+        if self.marker || self.no_gravity {
+            return None;
+        }
+        let (width, height) = armor_stand_size(self);
+        Some((width as f32, height as f32))
     }
 }
 
@@ -2094,6 +2076,7 @@ mod no_gravity_stand_tests {
         assert!(!stand.sweeps_blocks_inside());
         stand.no_gravity = false;
         stand.marker = true;
+        assert!(!stand.sweeps_blocks_inside());
         assert!(!stand.triggers_blocks());
     }
 }
@@ -2303,6 +2286,7 @@ mod set_rotation_tests {
     #[test]
     fn set_rotation_keeps_yaw_and_clamps_pitch_on_kinds_that_had_none() {
         let mut orb = ExperienceOrb {
+            fall_distance: 0.0,
             join: Default::default(),
             no_gravity: false,
             id: 0,
@@ -2315,8 +2299,10 @@ mod set_rotation_tests {
             count: 1,
             ticks: 0,
             health: 5,
+            air: 300,
             rotation: [0.0, 0.0],
             following: None,
+            fire_ticks: 0,
         };
         orb.set_rotation([90.0, 10.0]);
         assert_eq!(orb.rotation(), [90.0, 10.0]);

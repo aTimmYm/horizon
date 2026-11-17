@@ -3,7 +3,7 @@
 //! ticker, redstone output, resonance, shrieks and warden summoning
 //! (`SculkShriekerBlockEntity`, `SpawnUtil`), catalysts feeding the sculk
 //! spreader from deaths, and the darkness wardens and shriekers cast.
-use super::{Game, Result};
+use super::{Game, Result, commands::R};
 use horizon_client::actions::Action;
 use horizon_client::join_seq::ListStamp;
 use horizon_client::{
@@ -13,6 +13,7 @@ use horizon_client::{
     mobs::{Mob, Species, Who, allay, warden},
     particles::{ParticleOptions, ParticleType},
     sculk::{self, Context, Info, SculkEntity, SculkKind, WardenSpawnTracker},
+    text::Text,
 };
 use horizon_core::{
     geometry::{Aabb, Direction, Vec3},
@@ -323,10 +324,11 @@ impl Game<'_> {
             "chunks_known": self.sculk.known.len(),
         })
     }
-    /// `WardenSpawnTrackerCommand`: clear the player's tracker or set its
-    /// warning level.
-    pub(super) fn cmd_warden_spawn_tracker(&mut self, level: Option<i32>) {
-        use horizon_client::text::Text;
+    /// `WardenSpawnTrackerCommand`: the source player's tracker, cleared or set
+    /// to a warning level (`getPlayerOrException`: a mob or the server is refused).
+    pub(super) fn cmd_warden_spawn_tracker(&mut self, level: Option<i32>) -> R<i32> {
+        self.source_player()?;
+        self.load_warden_tracker();
         let key = match level {
             Some(level) => {
                 self.sculk.tracker.set_warning_level(level);
@@ -337,25 +339,20 @@ impl Game<'_> {
                 "commands.warden_spawn_tracker.clear.success.single"
             }
         };
-        if self.ui.rules.bool("send_command_feedback") {
-            self.system_message(Text::translate(
-                key,
-                &[Text::literal(super::chat::PLAYER_NAME)],
-            ));
-        }
+        // `sendFeedback` → `sendSuccess(…, broadcast = true)`: a silent source
+        // prints nothing, and the other operators hear it.
+        let name = self.source_display_name();
+        self.feedback(Text::translate(key, &[name]));
+        Ok(1)
     }
     /// `ServerPlayer`'s `warden_spawn_tracker` from the player data.
-    fn load_warden_tracker(&mut self) {
+    pub(super) fn load_warden_tracker(&mut self) {
         if self.sculk.tracker_loaded {
             return;
         }
         self.sculk.tracker_loaded = true;
-        if let Some(tag) = self
-            .level
-            .player_extra
-            .as_ref()
-            .and_then(|p| p.get("warden_spawn_tracker"))
-        {
+        let saved = self.level.player_extra.as_ref();
+        if let Some(tag) = saved.and_then(|p| p.get("warden_spawn_tracker")) {
             self.sculk.tracker = WardenSpawnTracker::from_nbt(tag);
         }
     }
@@ -369,9 +366,9 @@ impl Game<'_> {
     /// `store_owner` rewrites that from the owner's guest, so it puts the
     /// tracker there as well (`playerdata::with_warden`).
     pub(super) fn save_warden_tracker(&mut self) {
-        let Some(tag) = self.warden_tracker_tag() else {
-            return;
-        };
+        // Vanilla always stores it: read the saved one before writing.
+        self.load_warden_tracker();
+        let tag = self.sculk.tracker.to_nbt();
         let extra = self
             .level
             .player_extra
@@ -628,7 +625,7 @@ impl Game<'_> {
             spectator: false,
             stepping_carefully: false,
             dampens: mob.is_some_and(|m| m.species() == Species::Warden),
-            targetable: mob.is_some_and(|m| m.alive() && m.species() != Species::Warden),
+            targetable: mob.is_some_and(warden::can_be_targeted),
             living: true,
             player: mob.is_some_and(|m| m.rider.is_some()),
         }
@@ -967,8 +964,9 @@ impl Game<'_> {
     /// `Warden.VibrationUser`: accept a vibration for the warden at `index`.
     fn warden_listen(&mut self, index: usize, event: &'static str, pos: [f64; 3], ctx: &Context) {
         let now = self.world.game_time;
+        let ctx = warden::heard_by(*ctx, &self.mob_teams(), self.mobs[index].id);
         let (occludes, world) = (&self.sculk.tables.occludes, &self.world);
-        let avoided = warden::listen(&mut self.mobs[index], now, event, pos, ctx, |a, b| {
+        let avoided = warden::listen(&mut self.mobs[index], now, event, pos, &ctx, |a, b| {
             sculk::is_occluded(a, b, |p| {
                 let state = world.block(p.x, p.y, p.z);
                 occludes.get(state.0 as usize).copied().unwrap_or(false)
@@ -1865,6 +1863,60 @@ impl Game<'_> {
         }
         self.post_game_event(event, at, ctx);
     }
+    /// A projectile's own event (`gameEvent(event)`, `Context.of(this, state)`):
+    /// its owner as the projectile's owner, `state` the affected state. A
+    /// guest's projectile posts as theirs, or with no owner once they have left
+    /// (`Projectile.getOwner`), as its shot does.
+    pub(super) fn projectile_own_event(
+        &mut self,
+        event: &'static str,
+        owner: Option<Who>,
+        guest: Option<u32>,
+        at: [f64; 3],
+        state: Option<BlockStateId>,
+    ) {
+        if let Some(conn) = guest.filter(|conn| owner.is_some() && self.lan_acting != Some(*conn)) {
+            let posted = match self.lan.take() {
+                Some(mut host) => {
+                    let ran = self.as_guest(&mut host, conn, |g| {
+                        g.projectile_own_event(event, owner, None, at, state);
+                    });
+                    self.lan = Some(host);
+                    ran.is_some()
+                }
+                None => false,
+            };
+            if !posted {
+                self.projectile_own_event(event, None, None, at, state);
+            }
+            return;
+        }
+        let mut ctx = Context {
+            dampening_state: self.state_dampens(state),
+            ..Context::default()
+        };
+        ctx.owner = owner;
+        ctx.player = owner == Some(Who::Player) || self.rides_player(owner);
+        self.post_game_event(event, at, ctx);
+    }
+    /// The state HIT_GROUND names for an entity of `bounds` landing at
+    /// `position` (`Entity.checkFallDamage`): its supporting block's
+    /// (`mainSupportingBlockPos`), else the block at `getOnPosLegacy`.
+    pub(super) fn landing_state(&self, position: Vec3, bounds: Aabb) -> BlockStateId {
+        let p = self.landing_pos(position, bounds);
+        self.world.block(p.x, p.y, p.z)
+    }
+    /// Where [`Self::landing_state`] reads its block: the supporting block,
+    /// else `getOnPosLegacy`.
+    pub(super) fn landing_pos(&self, position: Vec3, bounds: Aabb) -> BlockPos {
+        self.supporting_block(position, bounds).unwrap_or_else(|| {
+            BlockPos::new(
+                position.x.floor() as i32,
+                (position.y - 0.2).floor() as i32,
+                position.z.floor() as i32,
+            )
+        })
+    }
     /// The player shot or threw something.
     pub(super) fn player_projectile_shot(&mut self) {
         if let Some(p) = self.player.as_ref() {
@@ -1935,15 +1987,7 @@ impl Game<'_> {
             return;
         }
         self.sculk_prepare();
-        // mainSupportingBlockPos, or the block's state at getOnPosLegacy.
-        let state = match self.supporting_block(position, bounds) {
-            Some(support) => self.world.block(support.x, support.y, support.z),
-            None => self.world.block(
-                position.x.floor() as i32,
-                (position.y - 0.2).floor() as i32,
-                position.z.floor() as i32,
-            ),
-        };
+        let state = self.landing_state(position, bounds);
         let mut context = self.who_context(None, Some(state));
         context.living = living;
         self.post_game_event(
@@ -2956,3 +3000,6 @@ mod shriek_capture_tests {
 #[cfg(test)]
 #[path = "farm_animal_interaction_tests.rs"]
 mod farm_animal_interaction_tests;
+
+#[cfg(test)]
+mod warden_spawn_tracker_tests;

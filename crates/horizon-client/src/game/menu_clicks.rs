@@ -106,6 +106,33 @@ impl Game<'_> {
             self.send_creative_slots();
         }
     }
+    /// Bedrock's tick when a stack splits: a right-click with an empty hand on a stack of more
+    /// than one, which the menu halves. Returns the clicked slot and the counts that confirm
+    /// the click actually did it (the stack before, and the half the hand should hold after).
+    pub(super) fn split_click(
+        &mut self,
+        ops: &[(Option<usize>, i32, horizon_client::menu::Input)],
+    ) -> Option<(usize, u32, u32)> {
+        let [(Some(slot), 1, horizon_client::menu::Input::Pickup)] = ops else {
+            return None;
+        };
+        if self.carried.is_some() {
+            return None;
+        }
+        let stack = self.slot_mut(*slot).clone()?;
+        (stack.count > 1).then(|| (*slot, stack.count, stack.count.div_ceil(2)))
+    }
+    /// Whether the menu did the split `split_click` described: the hand took the upper half and
+    /// the clicked slot kept the lower one.
+    pub(super) fn split_done(&mut self, split: (usize, u32, u32)) -> bool {
+        let (slot, before, half) = split;
+        let carried = self.carried.as_ref().is_some_and(|c| c.count == half);
+        carried
+            && self
+                .slot_mut(slot)
+                .clone()
+                .is_some_and(|s| s.count.saturating_add(half) == before)
+    }
     /// Several clicks on one menu instance (a quick craft drag is three).
     pub(super) fn menu_ops(
         &mut self,
@@ -125,6 +152,7 @@ impl Game<'_> {
         if let [(Some(slot), button, input)] = ops {
             self.crafter_slot_clicked(*slot, *button, *input);
         }
+        let split = self.split_click(ops);
         let ops = ops.to_vec();
         let done = self.menu_session(move |menu, env, to_menu| {
             let mut clicks = Vec::new();
@@ -154,6 +182,14 @@ impl Game<'_> {
         // CreativeModeInventoryScreen.slotClicked: the changed slots go out with the click.
         if done && self.remote.is_some() && self.screen == Screen::Creative {
             self.send_creative_slots();
+        }
+        // The pad's own click, and only the pad's: the mouse's split doesn't buzz.
+        if done
+            && self.input_made_pointer_event()
+            && let Some(split) = split
+            && self.split_done(split)
+        {
+            self.input_feedback(horizon_client::input_source::Feedback::ItemStackSplit);
         }
         done
     }
@@ -433,7 +469,7 @@ impl Game<'_> {
             .as_ref()
             .map(|s| (s.selected.map_or(-1, |i| i as i32), s.stone.clone()));
         let crafter_data = match self.container_kind() {
-            Some(BlockEntity::Crafter(c)) => Some((c.disabled, c.triggered)),
+            Some(BlockEntity::Crafter(c)) => Some((c.disabled, c.is_triggered())),
             _ => None,
         };
         // The merchant's session, lent to the menu for this click.
@@ -485,7 +521,7 @@ impl Game<'_> {
             brewing: &self.stations().brewing,
             banners: &self.stations().banners,
             station_recipes: &self.stations().recipes,
-            enchantments: &self.stations().enchantments,
+            enchantments: self.enchantments(),
             names: &self.pack.names,
             trade: Some(&trade_env),
             maps: level_maps
@@ -602,6 +638,9 @@ impl Game<'_> {
         let equipped = std::mem::take(&mut menu.equipped);
         let item_crafted = std::mem::take(&mut menu.item_crafted);
         for (_, stack) in &item_crafted {
+            if !predicting {
+                self.award_stat("crafted", &stack.item, stack.count as i32);
+            }
             self.tutorial_get_item(Some(stack));
         }
         for (i, stack) in after.into_iter().enumerate() {
@@ -653,10 +692,16 @@ impl Game<'_> {
                 self.station_sound(sound);
             }
         } else if kind == Kind::Stonecutter {
+            // `StonecutterMenu.container`'s listener runs on every change of the
+            // input slot (`slotsChanged` and `containerChanged` both hang off
+            // it): a recipe button or an inventory click is not one.
+            let input_changed = before[0] != menu.slot(0).cloned();
             if let Some(s) = self.station.as_mut() {
                 s.selected = usize::try_from(menu.data[0]).ok();
                 s.stone = std::mem::take(&mut menu.stone);
-                s.stonecutter_changed();
+                if input_changed {
+                    s.stonecutter_changed();
+                }
             }
             for sound in sounds.into_iter().filter(|_| !predicting) {
                 self.station_sound(sound);
@@ -675,14 +720,8 @@ impl Game<'_> {
             // EnchantmentMenu.slotsChanged: new offers for the item.
             self.station_changed();
         }
-        if kind == Kind::CrafterBlock
-            && let Some(BlockEntity::Crafter(c)) = self
-                .container
-                .and_then(|k| self.world.block_entities.get_mut(&k))
-        {
-            for (i, d) in c.disabled.iter_mut().enumerate() {
-                *d = menu.data[i] == 1;
-            }
+        if kind == Kind::CrafterBlock {
+            self.apply_crafter_slot_states(&menu);
         }
         if matches!(kind, Kind::Furnace(_))
             && let Some(BlockEntity::Furnace(f)) = self
@@ -705,6 +744,25 @@ impl Game<'_> {
             self.register_made_maps(maps);
         }
         true
+    }
+    /// `CrafterBlockEntity.setSlotState`: the menu's slot states land on the
+    /// block entity, whose `setChanged` marks the chunk for saving.
+    pub(super) fn apply_crafter_slot_states(&mut self, menu: &horizon_client::menu::Menu) {
+        let Some(key) = self.container else {
+            return;
+        };
+        let Some(BlockEntity::Crafter(c)) = self.world.block_entities.get_mut(&key) else {
+            return;
+        };
+        let mut changed = false;
+        for (i, d) in c.disabled.iter_mut().enumerate() {
+            let disabled = menu.data[i] == 1;
+            changed |= *d != disabled;
+            *d = disabled;
+        }
+        if changed {
+            self.container_changed(key);
+        }
     }
     pub(super) fn click_inventory(&mut self, right: bool) {
         if self.mod_browser_press(right) || self.mount_click(right) {
@@ -920,11 +978,8 @@ impl Game<'_> {
             return;
         };
         let at = [p.position.x, p.position.y, p.position.z];
-        let (volume, pitch) = if sound == horizon_client::bundle::INSERT_FAIL {
-            (1.0, 1.0)
-        } else {
-            (0.8, 0.8 + self.world.random.next_float() * 0.4)
-        };
+        let (volume, pitch) =
+            horizon_client::bundle::sound_volume_pitch(sound, || self.world.random.next_float());
         self.audio.play(sound, Some(at), volume, pitch);
     }
 }

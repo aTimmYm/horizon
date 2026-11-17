@@ -44,18 +44,13 @@ fn game() -> Game<'static> {
     .unwrap();
     game.build_registries();
     game.set_allow_commands(true);
-    // Entities tick once every chunk within 2 columns is loaded
-    // (ChunkMap.prepareEntityTickingChunk, #13953).
-    for x in -2..=2 {
-        for z in -2..=2 {
-            game.world
-                .chunks
-                .insert((x, z), Arc::new(Chunk::empty(x, z)));
-            game.block_ticks
-                .add_empty_chunk(ChunkPos::new(x, z))
-                .unwrap();
-        }
-    }
+    game.world
+        .chunks
+        .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+    game.block_ticks
+        .add_empty_chunk(ChunkPos::new(0, 0))
+        .unwrap();
+    game.load_ticking_neighbourhood(0, 0);
     assert!(game.run_command("fill 0 99 0 15 99 15 stone"));
     game
 }
@@ -108,3 +103,6 @@ fn a_pig_landing_fully_on_honey_takes_a_fifth_of_the_fall() {
     assert_eq!(supporting, Some([8, 99, 8]));
     assert_eq!(health, 10.0);
 }
+
+#[path = "mob_friction_tests.rs"]
+mod mob_friction_tests;

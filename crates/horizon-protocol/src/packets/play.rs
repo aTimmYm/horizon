@@ -17,15 +17,21 @@ use crate::{
             Disconnect, KeepAlive, Ping, ResourcePackPop, ResourcePackPush, ResourcePackResponse,
             ServerLinks, StoreCookie, Transfer, UpdateTags,
         },
-        login::Property,
     },
 };
 use horizon_world::nbt::Tag;
 
 mod advancements;
 mod commands;
+mod hud;
+mod player_info;
 pub use advancements::{Advancement, AdvancementDisplay, SeenAdvancements, UpdateAdvancements};
 pub use commands::{ARGUMENT_TYPES, ArgumentProperties, CommandNode, Commands};
+pub use hud::{
+    BossAction, BossEvent, NumberFormat, ResetScore, SetDisplayObjective, SetObjective,
+    SetPlayerTeam, SetScore, TeamParameters,
+};
+pub use player_info::{PlayerInfo, PlayerInfoRemove, PlayerInfoUpdate};
 
 // ---- shared structures -------------------------------------------------
 
@@ -244,7 +250,7 @@ impl Codec<i32> for HolderId {
     fn read(r: &mut Reader) -> Result<i32> {
         match r.varint()? {
             0 => Err(Error::new("inline registry values are not supported")),
-            id => Ok(id - 1),
+            id => Ok(id.wrapping_sub(1)),
         }
     }
     fn write(v: &i32, w: &mut Writer) {
@@ -263,7 +269,7 @@ impl Codec<DialogHolder> for DialogHolder {
     fn read(r: &mut Reader) -> Result<Self> {
         Ok(match r.varint()? {
             0 => Self::Direct(r.nbt()?),
-            id => Self::Registry(id - 1),
+            id => Self::Registry(id.wrapping_sub(1)),
         })
     }
     fn write(v: &Self, w: &mut Writer) {
@@ -601,7 +607,7 @@ packet!(PlayerAbilities { flags: i8 => Byte, flying_speed: f32 => Float, walking
 pub struct PackedSignature;
 impl Codec<(i32, Option<Vec<u8>>)> for PackedSignature {
     fn read(r: &mut Reader) -> Result<(i32, Option<Vec<u8>>)> {
-        let id = r.varint()? - 1;
+        let id = r.varint()?.wrapping_sub(1);
         Ok(if id == -1 {
             (-1, Some(r.bytes(256)?.to_vec()))
         } else {
@@ -665,117 +671,6 @@ packet!(
     DeleteChat { signature: (i32, Option<Vec<u8>>) => PackedSignature }
 );
 packet!(PlayerCombatKill { id: i32 => VarInt, message: Tag => Nbt });
-packet!(PlayerInfoRemove { uuids: Vec<u128> => List<Uuid> });
-/// One ClientboundPlayerInfoUpdatePacket entry; fields are set for the
-/// actions in the packet.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct PlayerInfo {
-    pub uuid: u128,
-    pub name: Option<String>,
-    pub properties: Vec<Property>,
-    /// RemoteChatSession.Data: session id, key expiry, key, key signature.
-    pub chat_session: Option<(u128, i64, Vec<u8>, Vec<u8>)>,
-    pub game_mode: Option<i32>,
-    pub listed: Option<bool>,
-    pub latency: Option<i32>,
-    pub display_name: Option<Option<Tag>>,
-    pub list_order: Option<i32>,
-    pub show_hat: Option<bool>,
-}
-/// Actions bits: ADD_PLAYER, INITIALIZE_CHAT, UPDATE_GAME_MODE, UPDATE_LISTED,
-/// UPDATE_LATENCY, UPDATE_DISPLAY_NAME, UPDATE_LIST_ORDER, UPDATE_HAT.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PlayerInfoUpdate {
-    pub actions: u8,
-    pub entries: Vec<PlayerInfo>,
-}
-impl Codec<PlayerInfoUpdate> for PlayerInfoUpdate {
-    fn read(r: &mut Reader) -> Result<Self> {
-        let actions = r.u8()?;
-        let n = r.count(r.remaining())?;
-        let mut entries = Vec::with_capacity(n.min(256));
-        for _ in 0..n {
-            let mut e = PlayerInfo {
-                uuid: r.uuid()?,
-                ..PlayerInfo::default()
-            };
-            if actions & 1 != 0 {
-                e.name = Some(r.string(16)?);
-                let count = r.count(16)?;
-                e.properties = (0..count)
-                    .map(|_| Property::read(r))
-                    .collect::<Result<_>>()?;
-            }
-            if actions & 2 != 0 && r.bool()? {
-                e.chat_session =
-                    Some((r.uuid()?, r.i64()?, r.byte_array(512)?, r.byte_array(4096)?));
-            }
-            if actions & 4 != 0 {
-                e.game_mode = Some(r.varint()?);
-            }
-            if actions & 8 != 0 {
-                e.listed = Some(r.bool()?);
-            }
-            if actions & 16 != 0 {
-                e.latency = Some(r.varint()?);
-            }
-            if actions & 32 != 0 {
-                e.display_name = Some(if r.bool()? { Some(r.nbt()?) } else { None });
-            }
-            if actions & 64 != 0 {
-                e.list_order = Some(r.varint()?);
-            }
-            if actions & 128 != 0 {
-                e.show_hat = Some(r.bool()?);
-            }
-            entries.push(e);
-        }
-        Ok(Self { actions, entries })
-    }
-    fn write(v: &Self, w: &mut Writer) {
-        w.u8(v.actions);
-        w.varint(v.entries.len() as i32);
-        for e in &v.entries {
-            w.uuid(e.uuid);
-            if v.actions & 1 != 0 {
-                w.string(e.name.as_deref().unwrap_or(""));
-                w.varint(e.properties.len() as i32);
-                e.properties.iter().for_each(|p| Property::write(p, w));
-            }
-            if v.actions & 2 != 0 {
-                w.bool(e.chat_session.is_some());
-                if let Some((id, expires, key, sig)) = &e.chat_session {
-                    w.uuid(*id);
-                    w.i64(*expires);
-                    w.byte_array(key);
-                    w.byte_array(sig);
-                }
-            }
-            if v.actions & 4 != 0 {
-                w.varint(e.game_mode.unwrap_or(0));
-            }
-            if v.actions & 8 != 0 {
-                w.bool(e.listed.unwrap_or(false));
-            }
-            if v.actions & 16 != 0 {
-                w.varint(e.latency.unwrap_or(0));
-            }
-            if v.actions & 32 != 0 {
-                let name = e.display_name.clone().flatten();
-                w.bool(name.is_some());
-                if let Some(t) = &name {
-                    w.nbt(t);
-                }
-            }
-            if v.actions & 64 != 0 {
-                w.varint(e.list_order.unwrap_or(0));
-            }
-            if v.actions & 128 != 0 {
-                w.bool(e.show_hat.unwrap_or(false));
-            }
-        }
-    }
-}
 packet!(PlayerPosition {
     teleport: i32 => VarInt,
     position: [f64; 3] => Vec3d,
@@ -910,7 +805,7 @@ impl Codec<(i32, Option<(String, Option<f32>)>)> for SoundHolder {
     fn read(r: &mut Reader) -> Result<(i32, Option<(String, Option<f32>)>)> {
         let id = r.varint()?;
         if id != 0 {
-            return Ok((crate::adapter::ids::sound_event(id - 1), None));
+            return Ok((crate::adapter::ids::sound_event(id.wrapping_sub(1)), None));
         }
         let location = r.string(32767)?;
         let range = if r.bool()? { Some(r.f32()?) } else { None };
@@ -989,93 +884,6 @@ packet!(
     /// ClientboundSetBorderWarningDistancePacket.
     SetBorderWarningDistance { blocks: i32 => VarInt }
 );
-packet!(
-    /// ClientboundSetDisplayObjectivePacket: `DisplaySlot` id (0 list,
-    /// 1 sidebar, 2 below name, 3.. team sidebars) and the objective ("" clears).
-    SetDisplayObjective { slot: i32 => VarInt, objective: String => Str }
-);
-packet!(
-    /// ClientboundResetScorePacket: one objective, or all of them when absent.
-    ResetScore { owner: String => Str, objective: Option<String> => Opt<Str> }
-);
-/// `NumberFormatTypes.STREAM_CODEC`, by `number_format_type` registry id.
-#[derive(Clone, Debug, PartialEq)]
-pub enum NumberFormat {
-    /// 0: `minecraft:blank`.
-    Blank,
-    /// 1: `minecraft:styled`, a style compound.
-    Styled(Tag),
-    /// 2: `minecraft:fixed`, a component.
-    Fixed(Tag),
-}
-impl Codec<NumberFormat> for NumberFormat {
-    fn read(r: &mut Reader) -> Result<Self> {
-        Ok(match r.varint()? {
-            0 => NumberFormat::Blank,
-            1 => NumberFormat::Styled(r.nbt()?),
-            2 => NumberFormat::Fixed(r.nbt()?),
-            other => return Err(crate::Error::new(format!("unknown number format {other}"))),
-        })
-    }
-    fn write(v: &Self, w: &mut Writer) {
-        match v {
-            NumberFormat::Blank => w.varint(0),
-            NumberFormat::Styled(t) => {
-                w.varint(1);
-                w.nbt(t);
-            }
-            NumberFormat::Fixed(t) => {
-                w.varint(2);
-                w.nbt(t);
-            }
-        }
-    }
-}
-packet!(
-    /// ClientboundSetScorePacket.
-    SetScore {
-        owner: String => Str,
-        objective: String => Str,
-        score: i32 => VarInt,
-        display: Option<Tag> => Opt<Nbt>,
-        number_format: Option<NumberFormat> => Opt<NumberFormat>,
-    }
-);
-/// ClientboundSetObjectivePacket: method 0 adds, 1 removes, 2 changes;
-/// adds and changes carry the display name, render type (0 integer,
-/// 1 hearts) and number format.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SetObjective {
-    pub name: String,
-    pub method: i8,
-    pub display: Option<(Tag, i32, Option<NumberFormat>)>,
-}
-impl Codec<SetObjective> for SetObjective {
-    fn read(r: &mut Reader) -> Result<Self> {
-        let name = r.string(32767)?;
-        let method = r.i8()?;
-        let display = if method == 0 || method == 2 {
-            Some((r.nbt()?, r.varint()?, <Opt<NumberFormat>>::read(r)?))
-        } else {
-            None
-        };
-        Ok(Self {
-            name,
-            method,
-            display,
-        })
-    }
-    fn write(v: &Self, w: &mut Writer) {
-        w.string(&v.name);
-        w.i8(v.method);
-        if v.method == 0 || v.method == 2 {
-            let (name, render, format) = v.display.clone().unwrap_or((Tag::End, 0, None));
-            w.nbt(&name);
-            w.varint(render);
-            <Opt<NumberFormat>>::write(&format, w);
-        }
-    }
-}
 /// ClientboundLevelParticlesPacket: a particle, whether it ignores the
 /// client's particle setting (`overrideLimiter`) and its distance limit
 /// (`alwaysShow`), where, the spread and the speed on each axis, how many
@@ -1187,85 +995,6 @@ impl Codec<Explode> for Explode {
         w.bool(v.play_sound);
     }
 }
-/// `ClientboundSetPlayerTeamPacket.Parameters`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TeamParameters {
-    pub display_name: Tag,
-    pub prefix: Tag,
-    pub suffix: Tag,
-    /// `Team.Visibility` id.
-    pub name_tag_visibility: i32,
-    /// `Team.CollisionRule` id.
-    pub collision_rule: i32,
-    /// `TeamColor` id (0 black .. 15 white), absent for no colour.
-    pub color: Option<i32>,
-    /// 1: friendly fire, 2: see friendly invisibles.
-    pub options: i8,
-}
-/// ClientboundSetPlayerTeamPacket: method 0 adds (parameters and players),
-/// 1 removes, 2 changes (parameters), 3 joins and 4 leaves (players).
-#[derive(Clone, Debug, PartialEq)]
-pub struct SetPlayerTeam {
-    pub name: String,
-    pub method: i8,
-    pub parameters: Option<TeamParameters>,
-    pub players: Vec<String>,
-}
-impl Codec<SetPlayerTeam> for SetPlayerTeam {
-    fn read(r: &mut Reader) -> Result<Self> {
-        let name = r.string(32767)?;
-        let method = r.i8()?;
-        let parameters = if method == 0 || method == 2 {
-            Some(TeamParameters {
-                display_name: r.nbt()?,
-                prefix: r.nbt()?,
-                suffix: r.nbt()?,
-                name_tag_visibility: r.varint()?,
-                collision_rule: r.varint()?,
-                color: <Opt<VarInt>>::read(r)?,
-                options: r.i8()?,
-            })
-        } else {
-            None
-        };
-        let players = if matches!(method, 0 | 3 | 4) {
-            <List<Str>>::read(r)?
-        } else {
-            Vec::new()
-        };
-        Ok(Self {
-            name,
-            method,
-            parameters,
-            players,
-        })
-    }
-    fn write(v: &Self, w: &mut Writer) {
-        w.string(&v.name);
-        w.i8(v.method);
-        if v.method == 0 || v.method == 2 {
-            let p = v.parameters.clone().unwrap_or(TeamParameters {
-                display_name: Tag::End,
-                prefix: Tag::End,
-                suffix: Tag::End,
-                name_tag_visibility: 0,
-                collision_rule: 0,
-                color: None,
-                options: 0,
-            });
-            w.nbt(&p.display_name);
-            w.nbt(&p.prefix);
-            w.nbt(&p.suffix);
-            w.varint(p.name_tag_visibility);
-            w.varint(p.collision_rule);
-            <Opt<VarInt>>::write(&p.color, w);
-            w.i8(p.options);
-        }
-        if matches!(v.method, 0 | 3 | 4) {
-            <List<Str>>::write(&v.players, w);
-        }
-    }
-}
 packet!(ServerData { motd: Tag => Nbt, icon: Option<Vec<u8>> => Opt<crate::buf::Bytes> });
 packet!(
     /// ClientboundUpdateMobEffectPacket; flags: 1 ambient, 2 visible, 4 icon, 8 blend.
@@ -1358,125 +1087,6 @@ impl Codec<Vec<(i32, i32, i32)>> for StatList {
             w.varint(a);
             w.varint(b);
             w.varint(c);
-        }
-    }
-}
-
-/// `ClientboundBossEventPacket` (`boss_event`).
-#[derive(Clone, Debug, PartialEq)]
-pub enum BossAction {
-    Add {
-        name: Tag,
-        progress: f32,
-        /// `BossBarColor` ordinal.
-        color: i32,
-        /// `BossBarOverlay` ordinal.
-        overlay: i32,
-        darken: bool,
-        music: bool,
-        fog: bool,
-    },
-    Remove,
-    UpdateProgress {
-        progress: f32,
-    },
-    UpdateName {
-        name: Tag,
-    },
-    UpdateStyle {
-        color: i32,
-        overlay: i32,
-    },
-    UpdateProperties {
-        darken: bool,
-        music: bool,
-        fog: bool,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct BossEvent {
-    pub id: u128,
-    pub action: BossAction,
-}
-fn boss_flags(darken: bool, music: bool, fog: bool) -> u8 {
-    u8::from(darken) | (u8::from(music) << 1) | (u8::from(fog) << 2)
-}
-fn split_flags(flags: u8) -> (bool, bool, bool) {
-    (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0)
-}
-impl Codec<BossEvent> for BossEvent {
-    fn read(r: &mut Reader) -> Result<BossEvent> {
-        let id = r.uuid()?;
-        let action = match r.varint()? {
-            0 => {
-                let name = r.nbt()?;
-                let progress = r.f32()?;
-                let color = r.varint()?;
-                let overlay = r.varint()?;
-                let (darken, music, fog) = split_flags(r.u8()?);
-                BossAction::Add {
-                    name,
-                    progress,
-                    color,
-                    overlay,
-                    darken,
-                    music,
-                    fog,
-                }
-            }
-            1 => BossAction::Remove,
-            2 => BossAction::UpdateProgress { progress: r.f32()? },
-            3 => BossAction::UpdateName { name: r.nbt()? },
-            4 => BossAction::UpdateStyle {
-                color: r.varint()?,
-                overlay: r.varint()?,
-            },
-            5 => {
-                let (darken, music, fog) = split_flags(r.u8()?);
-                BossAction::UpdateProperties { darken, music, fog }
-            }
-            op => return Err(Error::new(format!("unknown boss event operation {op}"))),
-        };
-        Ok(BossEvent { id, action })
-    }
-    fn write(v: &BossEvent, w: &mut Writer) {
-        w.uuid(v.id);
-        match &v.action {
-            BossAction::Add {
-                name,
-                progress,
-                color,
-                overlay,
-                darken,
-                music,
-                fog,
-            } => {
-                w.varint(0);
-                w.nbt(name);
-                w.f32(*progress);
-                w.varint(*color);
-                w.varint(*overlay);
-                w.u8(boss_flags(*darken, *music, *fog));
-            }
-            BossAction::Remove => w.varint(1),
-            BossAction::UpdateProgress { progress } => {
-                w.varint(2);
-                w.f32(*progress);
-            }
-            BossAction::UpdateName { name } => {
-                w.varint(3);
-                w.nbt(name);
-            }
-            BossAction::UpdateStyle { color, overlay } => {
-                w.varint(4);
-                w.varint(*color);
-                w.varint(*overlay);
-            }
-            BossAction::UpdateProperties { darken, music, fog } => {
-                w.varint(5);
-                w.u8(boss_flags(*darken, *music, *fog));
-            }
         }
     }
 }

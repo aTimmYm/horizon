@@ -32,14 +32,23 @@ impl Minecart {
             }
             map.remove(&JavaString::from("DisplayOffset"));
             map.remove(&JavaString::from("DisplayState"));
+            map.remove(&JavaString::from("explosion_power"));
+            map.remove(&JavaString::from("explosion_speed_factor"));
+            crate::game::boats::put_ticks_frozen(map, self.ticks_frozen);
+            let loaded_fire = map
+                .get(&JavaString::from("Fire"))
+                .and_then(horizon_client::nbt_path::int_value)
+                .unwrap_or(0) as i16;
             let mut put = |k: &str, v: Tag| {
                 map.insert(JavaString::from(k), v);
             };
             put("FlippedRotation", Tag::Byte(i8::from(self.flipped)));
-            // AbstractMinecart saves firstTick as HasTicked. A cart never burns:
-            // Entity.move sets -getFireImmuneTicks(), 0 for all but players.
+            // AbstractMinecart saves firstTick as HasTicked. A cart that is not
+            // on fire never burns: Entity.move sets -getFireImmuneTicks(), 0 for
+            // all but players. One loaded on fire stays so, with no baseTick to
+            // count its fire ticks down.
             put("HasTicked", Tag::Byte(i8::from(self.first_tick)));
-            put("Fire", Tag::Short(0));
+            put("Fire", Tag::Short(loaded_fire.max(0)));
             // addAdditionalSaveData: the offset only off its default, the state only when set.
             if let Some(offset) = self.custom_offset
                 && f64::from(offset) != default_display_offset(self.kind)
@@ -61,7 +70,26 @@ impl Minecart {
                     put("PushZ", Tag::Double(self.push.z.to_bits()));
                     put("Fuel", Tag::Short(self.fuel as i16));
                 }
-                CartKind::Tnt => put("fuse", Tag::Int(self.fuse)),
+                // MinecartTNT.addAdditionalSaveData: the powers only off their defaults.
+                CartKind::Tnt => {
+                    put("fuse", Tag::Int(self.fuse));
+                    for (key, value, default) in [
+                        (
+                            "explosion_power",
+                            self.explosion_power,
+                            DEFAULT_EXPLOSION_POWER,
+                        ),
+                        (
+                            "explosion_speed_factor",
+                            self.explosion_speed_factor,
+                            DEFAULT_EXPLOSION_SPEED_FACTOR,
+                        ),
+                    ] {
+                        if value != default {
+                            put(key, Tag::Float(value.to_bits()));
+                        }
+                    }
+                }
                 // BaseCommandBlock.save (its CustomName shares the entity's key).
                 CartKind::CommandBlock => {
                     for (key, value) in self.command.save() {
@@ -139,6 +167,7 @@ impl Minecart {
         };
         // Entity.load: OnGround and fall_distance, as saved.
         (c.on_ground, c.fall_distance) = horizon_client::entity_nbt::ground_from_nbt(tag);
+        c.ticks_frozen = crate::game::boats::saved_ticks_frozen(tag);
         c.flipped = flag("FlippedRotation", false);
         c.first_tick = flag("HasTicked", false);
         if kind.slots() > 0 {
@@ -149,6 +178,21 @@ impl Minecart {
         // readAdditionalSaveData: the saved push has no y.
         c.push = Vec3::new(double("PushX"), 0.0, double("PushZ"));
         c.fuse = int("fuse").unwrap_or(-1);
+        if kind == CartKind::Tnt {
+            // MinecartTNT.readAdditionalSaveData: getFloatOr, kept to 0..128.
+            let float = |k: &str, default: f32| match tag.get(k) {
+                Some(Tag::Float(v)) => f32::from_bits(*v),
+                Some(Tag::Double(v)) => f64::from_bits(*v) as f32,
+                Some(Tag::Long(v)) => *v as f32,
+                Some(other) => {
+                    horizon_client_core::nbt_path::int_value(other).map_or(default, |v| v as f32)
+                }
+                None => default,
+            };
+            c.explosion_power = float("explosion_power", DEFAULT_EXPLOSION_POWER).clamp(0.0, 128.0);
+            c.explosion_speed_factor =
+                float("explosion_speed_factor", DEFAULT_EXPLOSION_SPEED_FACTOR).clamp(0.0, 128.0);
+        }
         // readAdditionalSaveData: DisplayState, DisplayOffset (default offset when absent).
         c.custom_display = tag.get("DisplayState").cloned();
         c.custom_offset = int("DisplayOffset");

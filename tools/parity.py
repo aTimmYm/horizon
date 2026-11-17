@@ -90,27 +90,33 @@ FAILURE_TAILS, FAILURE_TAIL_LINES = 10, 30  # the summary prints the end of the 
 
 
 def harness_settings(path):
-    """PARITY_SHARDS and PARITY_RUST_SCOPE, read from a harness's source without running it."""
+    """PARITY_SHARDS, PARITY_RUST_SCOPE and PARITY_MANUAL, read from a harness's source without running it."""
     import ast
     text = Path(path).read_text(encoding="utf-8")
     settings = {}
     if "PARITY_" in text:
         for node in ast.parse(text).body:
             if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) \
-                    and node.targets[0].id in ("PARITY_SHARDS", "PARITY_RUST_SCOPE"):
+                    and node.targets[0].id in ("PARITY_SHARDS", "PARITY_RUST_SCOPE", "PARITY_MANUAL"):
                 settings[node.targets[0].id] = ast.literal_eval(node.value)
     return settings
 
 
 SHARDS = {}  # "datafix#2" -> "2/8": the share of a sharded harness each entry runs (PARITY_SHARD)
+MANUAL = {}  # "guest_close_event" -> how to run it: a proof script that needs arguments, which no run starts
 
 
 def harnesses():
-    """Harness names and scripts. A harness declaring PARITY_SHARDS = N runs as N entries, NAME#1 to NAME#N."""
+    """Harness names and scripts. A harness declaring PARITY_SHARDS = N runs as N entries, NAME#1 to NAME#N.
+    A script declaring PARITY_MANUAL = "<how to run it>" is a proof run by hand with arguments: left out (MANUAL)."""
     found = {}
     for path in sorted((ROOT / "tools").glob("test_*_parity.py")):
         name = path.name[len("test_"):-len("_parity.py")]
-        count = harness_settings(path).get("PARITY_SHARDS", 1)
+        settings = harness_settings(path)
+        if settings.get("PARITY_MANUAL"):
+            MANUAL[name] = settings["PARITY_MANUAL"]
+            continue
+        count = settings.get("PARITY_SHARDS", 1)
         if count > 1:
             for index in range(1, count + 1):
                 found[f"{name}#{index}"] = path
@@ -200,9 +206,22 @@ def environment_key(hasher):
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
 
+# Directories whose modules a harness finds by file name (tools/command_exec_corpus.py, discovered_groups): a
+# harness that recorded one of their files depends on all of them, also on one added after its record was made.
+GROUP_DIRECTORIES = ("tools/command_exec_groups/",)
+
+
+def group_files(dependencies):
+    """The .py files now in the GROUP_DIRECTORIES that dependencies name a file of, as paths from ROOT."""
+    plain = {path.split(KEEP)[0].replace("\\", "/") for path in dependencies}
+    return {file.relative_to(ROOT).as_posix()
+            for directory in GROUP_DIRECTORIES if any(path.startswith(directory) for path in plain)
+            for file in (ROOT / directory).glob("*.py")}
+
+
 def key(record, hasher, environment):
     digest = hashlib.sha256(environment.encode())
-    for path in sorted(record["dependencies"]):
+    for path in sorted({*record["dependencies"], *group_files(record["dependencies"])}):
         digest.update(f"{path}\0{hasher(ROOT / path)}\n".encode())
     return digest.hexdigest()
 
@@ -820,7 +839,8 @@ def outcome(name, script, passed, elapsed, trace_path, hasher=None):
         if passed:
             clear_large_outputs(name, trace)
         if hasher is not None:
-            record["hashes"] = {path: hasher(ROOT / path) for path in record["dependencies"]}
+            record["hashes"] = {path: hasher(ROOT / path)
+                                for path in {*record["dependencies"], *group_files(record["dependencies"])}}
     else:
         record["dependencies"], record["artifacts"] = [], []
     return record
@@ -1523,6 +1543,9 @@ def affected_harnesses(found, records, changed, reach=True, base=None):
         dependencies = [canonical_dependency_path(path) for path in dependencies]
         plain = {path.split(KEEP)[0] for path in dependencies}
         hit = (plain & changed) | parity_reach.unrecorded(ROOT, plain, changed)
+        # A group file added since the record was made isn't in it: the directory's other files stand for it.
+        hit |= {path for path in changed for directory in GROUP_DIRECTORIES
+                if path.startswith(directory) and any(known.startswith(directory) for known in plain)}
         if not hit:
             continue
         if graph is None or any(not path.startswith("crates/") for path in hit):
@@ -1652,6 +1675,9 @@ def main():
     # A sharded harness's name stands for all its shards.
     args.names = [entry for name in args.names for entry in ([name] if name in found else
                   [shard for shard in found if base_name(shard) == name] or [name])]
+    by_hand = [name for name in args.names if name in MANUAL]
+    if by_hand:
+        parser.error("; ".join(f"{name} is run by hand, not by parity.py: {MANUAL[name]}" for name in by_hand))
     unknown = [name for name in args.names if name not in found]
     if unknown:
         parser.error("unknown harnesses: " + ", ".join(unknown))

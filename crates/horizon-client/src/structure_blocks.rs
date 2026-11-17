@@ -244,9 +244,10 @@ pub fn roll_container(
         ))
     });
     if let Some(loot) = loot {
-        // LootTable.fill spreads the items over the container's own size.
-        let rolled = loot.fill(&table, seed, slots.len(), Some(biome));
-        for (slot, stack) in slots.iter_mut().zip(rolled) {
+        // LootTable.fill shuffles only available slots and keeps occupied ones.
+        let empty = slots.iter().filter(|slot| slot.is_none()).count();
+        let rolled = loot.fill(&table, seed, empty, Some(biome));
+        for (slot, stack) in slots.iter_mut().filter(|slot| slot.is_none()).zip(rolled) {
             // With what the rolls put on them: enchantments
             // (enchant_with_levels in End city chests), potions and an
             // ominous bottle's level.
@@ -570,8 +571,14 @@ mod tests {
             panic!("a banner block makes a banner block entity");
         };
         assert_eq!(banner.layers.len(), 2);
-        assert_eq!(&*banner.layers[0].pattern, "minecraft:triangle_top");
-        assert_eq!(&*banner.layers[1].pattern, "minecraft:triangle_bottom");
+        assert_eq!(
+            banner.layers[0].pattern.id(),
+            Some("minecraft:triangle_top")
+        );
+        assert_eq!(
+            banner.layers[1].pattern.id(),
+            Some("minecraft:triangle_bottom")
+        );
         assert_eq!(&*banner.layers[0].color, "black");
         // A banner the template saved without patterns stays bare.
         let Some(BlockEntity::Banner(bare)) =

@@ -15,10 +15,30 @@ use std::collections::BTreeSet;
 use crate::config::{self, Config};
 use crate::custom::Custom;
 use crate::{
-    ComputeProgram, eval_condition, preprocess, translate_composite, translate_compute,
-    translate_gbuffers, translate_shadow,
+    ComputeProgram, eval_condition, preprocess, translate_composite, translate_gbuffers,
+    translate_shadow,
 };
 use crate::{GbuffersInputs, Macros, Pack, Preprocessed, Program, Properties, Target};
+
+/// `indirect.<pass>`: three unsigned work-group counts in a storage buffer (3.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndirectDispatch {
+    pub buffer: u32,
+    pub offset: u64,
+}
+
+impl IndirectDispatch {
+    fn parse(value: &str) -> Option<Self> {
+        let mut words = value.split_whitespace();
+        let buffer = words.next()?.parse().ok()?;
+        let offset: u64 = words.next()?.parse().ok()?;
+        if buffer > 8 || !offset.is_multiple_of(4) || words.next().is_some() {
+            return None;
+        }
+        offset.checked_add(12)?;
+        Some(Self { buffer, offset })
+    }
+}
 
 /// Which group of 2.1 a program belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,10 +333,20 @@ impl BufferSize {
 }
 
 /// `bufferObject.<n>`: an SSBO's size in bytes, or bytes per pixel of the render size scaled.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum BufferObject {
     Bytes(u64),
-    PerPixel { bytes: u64, scale: [f32; 2] },
+    PerPixel {
+        bytes: u64,
+        scale: [f32; 2],
+    },
+    /// A fixed size with the bytes a file of the pack holds, read on load: the documented
+    /// `bufferObject.<n> = <size> <file>` form, the file's path inside `shaders`.
+    File {
+        bytes: u64,
+        path: String,
+        data: Vec<u8>,
+    },
 }
 
 impl BufferObject {
@@ -329,20 +359,42 @@ impl BufferObject {
                 bytes,
                 scale: [x.parse().ok()?, y.parse().ok()?],
             }),
+            [_, path] => Some(Self::File {
+                bytes,
+                path: path.to_owned(),
+                data: Vec::new(),
+            }),
             _ => None,
         }
     }
 
     /// The size in bytes for a render size of `render`, at least 16.
-    pub fn size(self, render: [u32; 2]) -> u64 {
+    pub fn size(&self, render: [u32; 2]) -> u64 {
         match self {
-            Self::Bytes(b) => b,
+            Self::Bytes(b) => *b,
             Self::PerPixel { bytes, scale } => {
                 let [w, h] = [0, 1].map(|k| (render[k] as f32 * scale[k]) as u64);
                 bytes.saturating_mul(w).saturating_mul(h)
             }
+            Self::File { bytes, .. } => *bytes,
         }
         .max(16)
+    }
+
+    /// The file's path inside `shaders`, when the buffer is initialized from one.
+    pub fn file(&self) -> Option<&str> {
+        match self {
+            Self::File { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The bytes the buffer starts with, when it is initialized from a file.
+    pub fn initial_data(&self) -> Option<&[u8]> {
+        match self {
+            Self::File { data, .. } => Some(data),
+            _ => None,
+        }
     }
 }
 
@@ -664,6 +716,27 @@ pub struct GameInputs {
 
 /// Loads the post-processing programs of `folder` and, for the geometry `inputs` describes, the
 /// gbuffers programs it draws with.
+/// The buffer object with its file read, when it has one: the documented
+/// `bufferObject.<n> = <size> <file>` form reads the file's bytes from the pack. A file that
+/// is not there, or that is bigger than the buffer it fills, is refused with a note.
+fn buffer_object_file(pack: &Pack, object: BufferObject) -> Result<BufferObject, String> {
+    let BufferObject::File { bytes, path, .. } = &object else {
+        return Ok(object);
+    };
+    let Some(data) = pack.read(path) else {
+        return Err(format!("`{path}`: no such file in the pack"));
+    };
+    // The size the pack asks for, not the size the buffer is made (which is at least 16).
+    if data.len() as u64 > *bytes {
+        return Err(format!("`{path}`: bigger than the buffer it fills"));
+    }
+    Ok(BufferObject::File {
+        bytes: *bytes,
+        path: path.clone(),
+        data,
+    })
+}
+
 pub fn load_post(
     pack: &Pack,
     folder: &str,
@@ -730,13 +803,16 @@ pub fn load_post(
     for e in &properties.entries {
         if let Some(n) = e.key.strip_prefix("bufferObject.") {
             match (n.parse(), BufferObject::parse(&e.value)) {
-                (Ok(n), Some(b)) => _ = post.buffer_objects.insert(n, b),
+                (Ok(n), Some(b)) => match buffer_object_file(pack, b) {
+                    Ok(b) => _ = post.buffer_objects.insert(n, b),
+                    Err(note) => post.notes.push(note),
+                },
                 _ => post.notes.push(format!("`{}`: not a buffer object", e.key)),
             }
             continue;
         }
         if let Some(name) = e.key.strip_prefix("image.") {
-            match CustomImage::parse(name, &options.expand(&e.value)) {
+            match CustomImage::parse(name, &e.value) {
                 Some(i) => post.images.push(i),
                 None => post.notes.push(format!("`{}`: not an image", e.key)),
             }
@@ -1327,6 +1403,13 @@ impl Loader<'_> {
         ) {
             return None;
         }
+        let tessellated = self.pack.exists(&path("tcs")) || self.pack.exists(&path("tes"));
+        if tessellated {
+            self.post.notes.push(format!(
+                "{name}: uses a tessellation stage (unsupported); skipped"
+            ));
+            return None;
+        }
         if self.pack.exists(&path("gsh")) {
             let Some(inputs) = self.geometry.clone() else {
                 self.post.notes.push(format!(
@@ -1334,8 +1417,7 @@ impl Loader<'_> {
                 ));
                 return None;
             };
-            let (vsh, gsh) = (path("vsh"), path("gsh"));
-            return self.load_geometry(name, group, &vsh, &gsh, &fsh, &inputs);
+            return self.load_geometry(name.clone(), group, &vsh, &path("gsh"), &fsh, &inputs);
         }
         let vertex = self.preprocess(&vsh);
         let fragment = self.preprocess(&fsh);
@@ -1585,6 +1667,19 @@ impl Loader<'_> {
             {
                 continue;
             }
+            let indirect = match self.properties.get(&format!("indirect.{name}")) {
+                Some(value) => match IndirectDispatch::parse(&self.options.expand(value)) {
+                    Some(request) => Some(request),
+                    None => {
+                        self.post.notes.push(format!(
+                            "{name}: skipped: invalid indirect request; expected SSBO index 0–8 \
+                             and a four-byte-aligned byte offset"
+                        ));
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let pp = self.preprocess(&path);
             let problems = diagnostics(&pp);
             let notes = &mut self.post.notes;
@@ -1593,7 +1688,7 @@ impl Loader<'_> {
                 notes.push(format!("{name}: skipped"));
                 continue;
             }
-            match translate_compute(&pp) {
+            match crate::translate::translate_compute_dispatch(&pp, indirect) {
                 Ok(program) => {
                     notes.extend(
                         program
@@ -1765,6 +1860,46 @@ fn flips(properties: &Properties, program: &str) -> Vec<(u32, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_indirect_requests_skip_the_compute_instead_of_dispatching_directly() {
+        let pack = Pack::from_zip_bytes(
+            "original-indirect-property",
+            crate::pack::tests::zip(&[(
+                "shaders/composite.csh",
+                "#version 430\nlayout(local_size_x=1) in; void main() {}",
+            )]),
+        )
+        .unwrap();
+        for value in [
+            "",
+            "2",
+            "2 0 extra",
+            "-1 0",
+            "9 0",
+            "2 -4",
+            "2 2",
+            "2 18446744073709551612",
+        ] {
+            let properties =
+                Properties::parse(&format!("indirect.composite={value}"), &Macros::standard());
+            let post = load_post(
+                &pack,
+                "",
+                &properties,
+                &Macros::standard(),
+                &GameInputs::default(),
+            );
+            assert!(post.programs.is_empty(), "{value}: silently became direct");
+            assert!(
+                post.notes
+                    .iter()
+                    .any(|n| n.contains("invalid indirect request")),
+                "{value}: {:?}",
+                post.notes
+            );
+        }
+    }
 
     #[test]
     fn unsupported_defaults_are_notes_without_skipping_render_or_compute() {
@@ -1963,8 +2098,13 @@ mod tests {
 
     #[test]
     fn image_dimensions_expand_default_and_chosen_options() {
-        let bytes =
-            crate::pack::tests::zip(&[("shaders/options.glsl", "#define SIZE 16 // [8 16]\n")]);
+        let bytes = crate::pack::tests::zip(&[
+            ("shaders/options.glsl", "#define SIZE 16 // [8 16]\n"),
+            (
+                "shaders/shaders.properties",
+                "image.grid = none RGBA RGBA8 BYTE false false SIZE SIZE",
+            ),
+        ]);
         for (choice, expected) in [(None, [16, 16]), (Some("8"), [8, 8])] {
             let mut pack = Pack::from_zip_bytes("image.zip", bytes.clone()).unwrap();
             if let Some(value) = choice {
@@ -1973,16 +2113,96 @@ mod tests {
                     value.into(),
                 )]));
             }
-            let macros = Macros::standard();
-            let properties = Properties::parse(
-                "image.grid = none RGBA RGBA8 BYTE false false SIZE SIZE",
-                &macros,
-            );
+            let mut macros = Macros::standard();
+            let (properties, _) = crate::read_properties(&pack, &mut macros);
             let post = load_post(&pack, "", &properties, &macros, &GameInputs::default());
             assert!(post.notes.is_empty(), "{:?}", post.notes);
             assert_eq!(post.images.len(), 1);
             assert_eq!(post.images[0].size, ImageSize::Absolute(expected));
         }
+    }
+
+    #[test]
+    fn image_dimensions_keep_the_macros_of_their_own_line() {
+        let pack = Pack::from_zip_bytes(
+            "image.zip",
+            crate::pack::tests::zip(&[("shaders/placeholder.glsl", "")]),
+        )
+        .unwrap();
+        let macros = Macros::standard();
+        let properties = Properties::parse(
+            "#define SIZE 16\n\
+             image.first = none RGBA RGBA8 BYTE false false SIZE SIZE\n\
+             #undef SIZE\n\
+             #define SIZE 32\n\
+             image.second = none RGBA RGBA8 BYTE false false SIZE SIZE",
+            &macros,
+        );
+        let post = load_post(&pack, "", &properties, &macros, &GameInputs::default());
+        assert!(post.notes.is_empty(), "{:?}", post.notes);
+        let sizes: Vec<ImageSize> = post.images.iter().map(|i| i.size).collect();
+        assert_eq!(
+            sizes,
+            [ImageSize::Absolute([16, 16]), ImageSize::Absolute([32, 32])]
+        );
+    }
+
+    #[test]
+    fn an_image_does_not_see_an_option_undefined_before_it() {
+        let pack = Pack::from_zip_bytes(
+            "image.zip",
+            crate::pack::tests::zip(&[
+                ("shaders/options.glsl", "#define SIZE 16 // [16 32]\n"),
+                (
+                    "shaders/shaders.properties",
+                    "#undef SIZE\nimage.grid = none RGBA RGBA8 BYTE false false SIZE SIZE",
+                ),
+                ("shaders/placeholder.glsl", ""),
+            ]),
+        )
+        .unwrap();
+        let mut macros = Macros::standard();
+        let (properties, _) = crate::read_properties(&pack, &mut macros);
+        let post = load_post(&pack, "", &properties, &macros, &GameInputs::default());
+        assert!(post.images.is_empty(), "{:?}", post.images);
+        assert!(
+            post.notes.iter().any(|n| n.contains("not an image")),
+            "{:?}",
+            post.notes
+        );
+    }
+
+    #[test]
+    fn image_dimensions_expand_macros_the_properties_file_defines() {
+        let pack = Pack::from_zip_bytes(
+            "image.zip",
+            crate::pack::tests::zip(&[
+                (
+                    "shaders/options.glsl",
+                    "#define SKYBOX_RESOLUTION 128 // [128 256]\n",
+                ),
+                (
+                    "shaders/shaders.properties",
+                    "#if SKYBOX_RESOLUTION == 128\n\
+                     #define SKYBOX_RESOLUTION_X 384\n\
+                     #define SKYBOX_RESOLUTION_Y 256\n\
+                     #endif\n\
+                     image.skyBox2D = none RGBA RGBA8 BYTE false false \
+                     SKYBOX_RESOLUTION_X SKYBOX_RESOLUTION_Y",
+                ),
+                ("shaders/placeholder.glsl", ""),
+            ]),
+        )
+        .unwrap();
+        let mut macros = Macros::standard();
+        // The pack reads its properties with its options, and writes the size as macros it
+        // defines further up in the same file, inside an `#if` (IterationRP's
+        // `SKYBOX_RESOLUTION_X/Y`).
+        let (properties, _) = crate::read_properties(&pack, &mut macros);
+        let post = load_post(&pack, "", &properties, &macros, &GameInputs::default());
+        assert!(post.notes.is_empty(), "{:?}", post.notes);
+        assert_eq!(post.images.len(), 1);
+        assert_eq!(post.images[0].size, ImageSize::Absolute([384, 256]));
     }
 
     #[test]
@@ -2015,6 +2235,106 @@ mod tests {
     const FSH: &str = "#version 120\nuniform sampler2D colortex0;\nvarying vec2 uv;\n\
                        void main() {\n/* DRAWBUFFERS:3 */\n\
                        gl_FragData[0] = texture2D(colortex0, uv);\n}\n";
+
+    #[test]
+    fn a_buffer_object_can_name_the_file_it_starts_with() {
+        assert_eq!(
+            BufferObject::parse("16 data/seed.bin"),
+            Some(BufferObject::File {
+                bytes: 16,
+                path: "data/seed.bin".to_owned(),
+                data: Vec::new(),
+            })
+        );
+        // The other forms still read as they did.
+        assert_eq!(BufferObject::parse("4096"), Some(BufferObject::Bytes(4096)));
+        assert_eq!(
+            BufferObject::parse("16 true 0.5 0.25"),
+            Some(BufferObject::PerPixel {
+                bytes: 16,
+                scale: [0.5, 0.25]
+            })
+        );
+    }
+
+    #[test]
+    fn a_buffer_object_reads_the_file_it_names() {
+        let seed: Vec<u8> = (0..16).collect();
+        let pack = Pack::from_zip_bytes(
+            "buffer.zip",
+            crate::pack::tests::zip(&[
+                (
+                    "shaders/shaders.properties",
+                    b"bufferObject.2 = 16 data/seed.bin".to_vec(),
+                ),
+                ("shaders/data/seed.bin", seed.clone()),
+            ]),
+        )
+        .unwrap();
+        let macros = Macros::standard();
+        let properties = Properties::parse("bufferObject.2 = 16 data/seed.bin", &macros);
+        let post = load_post(&pack, "", &properties, &macros, &GameInputs::default());
+        assert!(post.notes.is_empty(), "{:?}", post.notes);
+        let buffer = post.buffer_objects.get(&2).expect("the buffer is there");
+        assert_eq!(buffer.initial_data(), Some(seed.as_slice()));
+        assert_eq!(buffer.size([1, 1]), 16);
+    }
+
+    #[test]
+    fn a_buffer_object_whose_file_is_missing_is_refused() {
+        let pack = Pack::from_zip_bytes(
+            "buffer.zip",
+            crate::pack::tests::zip(&[(
+                "shaders/shaders.properties",
+                b"bufferObject.2 = 16 data/seed.bin".to_vec(),
+            )]),
+        )
+        .unwrap();
+        let macros = Macros::standard();
+        let properties = Properties::parse("bufferObject.2 = 16 data/seed.bin", &macros);
+        let post = load_post(&pack, "", &properties, &macros, &GameInputs::default());
+        assert!(post.buffer_objects.is_empty());
+        assert_eq!(post.notes.len(), 1, "{:?}", post.notes);
+        assert!(post.notes[0].contains("data/seed.bin"), "{:?}", post.notes);
+    }
+
+    #[test]
+    fn a_buffer_object_whose_file_is_bigger_than_it_is_refused() {
+        let pack = Pack::from_zip_bytes(
+            "buffer.zip",
+            crate::pack::tests::zip(&[
+                (
+                    "shaders/shaders.properties",
+                    b"bufferObject.2 = 4 data/seed.bin".to_vec(),
+                ),
+                ("shaders/data/seed.bin", (0..16).collect::<Vec<u8>>()),
+            ]),
+        )
+        .unwrap();
+        let macros = Macros::standard();
+        let properties = Properties::parse("bufferObject.2 = 4 data/seed.bin", &macros);
+        let post = load_post(&pack, "", &properties, &macros, &GameInputs::default());
+        assert!(post.buffer_objects.is_empty());
+        assert_eq!(post.notes.len(), 1, "{:?}", post.notes);
+        assert!(post.notes[0].contains("bigger"), "{:?}", post.notes);
+    }
+
+    #[test]
+    fn a_buffer_object_whose_file_leaves_the_pack_is_refused() {
+        let pack = Pack::from_zip_bytes(
+            "buffer.zip",
+            crate::pack::tests::zip(&[(
+                "shaders/shaders.properties",
+                "bufferObject.2 = 16 ../seed.bin",
+            )]),
+        )
+        .unwrap();
+        let macros = Macros::standard();
+        let properties = Properties::parse("bufferObject.2 = 16 ../seed.bin", &macros);
+        let post = load_post(&pack, "", &properties, &macros, &GameInputs::default());
+        assert!(post.buffer_objects.is_empty());
+        assert_eq!(post.notes.len(), 1, "{:?}", post.notes);
+    }
 
     #[test]
     fn buffer_objects_and_images_parse() {
@@ -2248,6 +2568,9 @@ blend.composite1.colortex3 = ONE ONE ONE ONE
                 ("shaders/composite4.vsh", VSH),
                 ("shaders/composite4.fsh", FSH),
                 ("shaders/composite4.gsh", "x"),
+                ("shaders/composite6.vsh", VSH),
+                ("shaders/composite6.fsh", FSH),
+                ("shaders/composite6.tcs", "x"),
                 ("shaders/composite5.vsh", VSH),
                 (
                     "shaders/composite5.fsh",
@@ -2289,6 +2612,10 @@ blend.composite1.colortex3 = ONE ONE ONE ONE
             notes.contains(
                 "composite4: uses a geometry stage (supported for the shadow pass's terrain and entities only)"
             ),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("composite6: uses a tessellation stage (unsupported); skipped"),
             "{notes}"
         );
         assert!(notes.contains("composite5.fsh:2:"), "{notes}");

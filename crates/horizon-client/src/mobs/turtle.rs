@@ -710,8 +710,8 @@ mod tests {
             m.position = Vec3::new(0.5, 0.0, 0.5);
             m.extra.flag = true;
             m.extra.counter = 201;
-            m.random = LegacyRandom::new(7);
-            let mut lr = LegacyRandom::new(11);
+            m.random = horizon_core::random::EntityRandom::own(LegacyRandom::new(7));
+            let mut lr = crate::mobs::world::level_random(11);
             let mut level = lr.clone();
             let pitch = 0.9_f32 + level.next_float() * 0.2_f32;
             let mut own = m.random.clone();

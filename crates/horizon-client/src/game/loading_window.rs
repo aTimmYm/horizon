@@ -33,7 +33,7 @@ pub(super) fn build_renderer(
     api: horizon_client::graphics::GraphicsApi,
     translucent_batching: bool,
     vsync: bool,
-    // HDR and Smooth Gradients pick the frame, with what the window's display reported to the
+    // HDR picks the frame, with what the window's display reported to the
     // renderer before (`display`, `Renderer::new`).
     settings: &horizon_client::graphics::Graphics,
     shader_pack: shader_packs::PickedPack,
@@ -75,7 +75,7 @@ pub(super) fn build_renderer(
         previous,
         api,
         translucent_batching,
-        shader_pack.draws_flat,
+        (shader_pack.draws_flat, shader_pack.starts_wide),
         settings,
         shader_pack.frame(),
         display,
@@ -91,10 +91,11 @@ pub(super) fn build_renderer(
         .collect();
     renderer
         .hud
-        .set_text_shader(&renderer.device, atlas.text_shader.as_deref());
+        .set_text_shader(&renderer.device, atlas.text_shaders.gui.as_deref());
     pack.item_renderer
         .prepare_glint_atlas(renderer.device.limits().max_texture_dimension_2d, filtering)?;
     renderer.set_lines_shader(atlas.lines_shader.as_deref());
+    renderer.set_world_text_shaders(&atlas.text_shaders);
     renderer.set_sky_shaders(atlas.sky_shader.as_deref(), atlas.stars_shader.as_deref());
     renderer.set_custom_sky(&*pack.custom_sky);
     renderer.set_shared_material_maps(&atlas.material_maps);
@@ -115,6 +116,7 @@ pub(super) fn loading_renderer(
     panorama: Option<&Arc<horizon_client::gfx::panorama::Faces>>,
     previous: Option<&Renderer>,
     api: horizon_client::graphics::GraphicsApi,
+    rays: bool, // The startup pick declares `[ray_tracing]`: the world renderer keeps this device.
 ) -> Result<Renderer> {
     static FORCEFIELD: [u8; 4] = [0; 4];
     static EMPTY_HUD: [u8; 4] = [0, 0, 0, 255];
@@ -154,10 +156,13 @@ pub(super) fn loading_renderer(
         api,
         // It draws no terrain.
         false,
-        false,
+        (false, false),
         // An 8-bit frame, which HDR output takes as well: HDR off until the settings apply.
         &horizon_client::graphics::Graphics::default(),
-        Default::default(),
+        horizon_client::gfx::FrameRequest {
+            ray_tracing: rays,
+            ..Default::default()
+        },
         previous.map(|r| r.display_reading()).unwrap_or_default(),
     ))?;
     if let Some(atlas) = atlas {
@@ -338,6 +343,8 @@ pub(super) fn start_game<'a>(
                 fps_cap: None,
                 offscreen: game.options.offscreen,
                 game_dir: std::env::current_dir()?,
+                set: game.options.benchmark_set.clone(),
+                profile: game.options.benchmark_profile,
             },
         );
     }
